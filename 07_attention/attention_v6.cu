@@ -302,12 +302,6 @@ void attention_v6(
     if(is_causal && atten_mask){
         ERROR("is_causal and atten_mask can't simutanounsly be true");
     }
-    if (is_gqa && q_head % kv_head){
-        ERROR("set gqa, but q_head %% kv_head not equal 0: q_head is %d, kv_head is %d", q_head, kv_head);
-    }
-    if(!is_gqa && q_head != kv_head){
-        ERROR("not set gqa, but q_head and kv_head not equal: q_head is %d, kv_head is %d", q_head, kv_head);
-    }
     const int BLOCK_Q = 64;
     const int BLOCK_KV = 64;
     const int TB_SIZE = 128; // A100 can max support 1024 thread block
@@ -315,7 +309,6 @@ void attention_v6(
     const int NUM_WARPS = 4; // 128 / 32 = 4
     const int DIM = 64;
     // naive mha
-    if(q_head == kv_head){
         const int num_blocks = bs * q_head * cdiv(q_len, BLOCK_Q);
         if (head_dim != 64){
             ERROR("current only support head_dim =64");
@@ -330,7 +323,7 @@ void attention_v6(
 
         flash_atten_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>
         <<<num_blocks, TB_SIZE, smem_size>>>(
-            Q, K, V, O, scale, q_len, kv_len, bs, q_head, kv_head
+            Q, K, V, O, scale, q_len, kv_len, bs, q_head, kv_head, q_head / kv_head
         );
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -338,10 +331,6 @@ void attention_v6(
         }
 
         return;
-    }
+    
 
-    else{
-        // TODO implement gqa
-        ERROR("gqa not implemented");
-    }
 }
