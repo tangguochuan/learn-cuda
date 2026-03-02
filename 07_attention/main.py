@@ -18,7 +18,7 @@ CURRENT_DIR = Path(__file__).parent
 
 module = load(
     "my_ext",
-    sources=list(CURRENT_DIR.glob("attention*")),
+    sources=[str(CURRENT_DIR / "attention.cpp"), str(CURRENT_DIR / "attention_v6.cu")],
     extra_cuda_cflags=["-lineinfo", "--ptxas-options=-v"],
     verbose=True,
 )
@@ -37,7 +37,7 @@ def main():
     nh = args.nh
     lq = args.lq
     lkv = args.lkv
-    head_dim = 128
+    head_dim = 64
 
     # add a small offset so that output does not have a mean of zero,
     # which will result in large relative error
@@ -56,6 +56,15 @@ def main():
         elif args.profile == "cudnn":
             with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
                 F.scaled_dot_product_attention(Q, K, V)
+
+        elif args.profile == "v6":
+            out_ref = F.scaled_dot_product_attention(Q, K, V)
+            out = module.sdpa_v6(Q, K, V)
+            torch.testing.assert_close(out, out_ref)
+            print("Correctness test passed!")
+            latency_ms = do_bench(lambda: module.sdpa_v6(Q, K, V), return_mode="median")
+            tflops = 4 * bs * nh * lq * lkv * head_dim / latency_ms / 1e9
+            print(f"Latency: {latency_ms:.4f} ms, TFLOPS: {tflops:.2f}")
 
         else:
             f = getattr(module, f"sdpa_v{args.profile}")
@@ -98,11 +107,10 @@ def main():
             V.transpose(1, 2),
         )
 
-    for i in range(5):
-        f = getattr(module, f"sdpa_v{i + 1}")
-        out = f(Q, K, V)
-        torch.testing.assert_close(out, out_ref)
-        bench_and_print(f, f"v{i + 1}", Q, K, V)
+    f = module.sdpa_v6
+    out = f(Q, K, V)
+    torch.testing.assert_close(out, out_ref)
+    bench_and_print(f, "v6", Q, K, V)
 
     df = pd.DataFrame(results, columns=["Kernel", "Latency (ms)", "TFLOPS", "% SOL"])
     print(df.to_markdown(index=False))

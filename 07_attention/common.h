@@ -5,6 +5,9 @@
 
 #include <cuda_bf16.h>
 
+#define ANSI_GREEN "\033[32m"
+#define ANSI_RED  "\033[31m"
+#define ANSI_RESET "\033[0m"
 #define CUDA_CHECK(x)                                                                                                  \
   {                                                                                                                    \
     auto error = x;                                                                                                    \
@@ -14,6 +17,30 @@
     }                                                                                                                  \
   }
 
+#define LOG(fmt, ...) \
+        printf(ANSI_GREEN "[LOG] " fmt ANSI_RESET "\n", ##__VA_ARGS__)
+
+#define ERROR(fmt, ...) \
+  do { \
+    fprintf(stderr, ANSI_RED "[ERROR]: [%s:%d] " fmt ANSI_RESET "\n",__FILE__, __LINE__ ,##__VA_ARGS__); \
+    exit(1); \
+  }while(0)
+
+#define ASSERT_NOT_NULL(...) \
+    do { \
+        const void *_ptrs[] = {__VA_ARGS__}; \
+        const char *_names = #__VA_ARGS__; \
+        int _n = sizeof(_ptrs) / sizeof(_ptrs[0]); \
+        char _buf[256]; \
+        strncpy(_buf, _names, sizeof(_buf)); \
+        char *_tok = strtok(_buf, ","); \
+        for (int _i = 0; _i < _n; _i++) { \
+            if (!_ptrs[_i]) { \
+                ERROR("assertion failed: '%s' is a nullptr", _tok ? _tok : "?"); \
+            } \
+            _tok = strtok(NULL, " ,"); \
+        } \
+    } while(0)
 inline constexpr int WARP_SIZE = 32;
 
 __device__ __host__ constexpr
@@ -63,6 +90,46 @@ void global_to_shared_swizzle(uint32_t dst, const nv_bfloat16 *src, int src_stri
     const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
     const nv_bfloat16 *src_addr = src + (row * src_stride + col);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
+  }
+}
+
+template <int HEIGHT, int WIDTH, int TB_SIZE>
+__device__ inline
+void gloabl_to_shared_swizzle_padded(
+  uint32_t dst,
+  const nv_bfloat16 *src,
+  int src_stride,
+  int tid,
+  int valid_height
+){
+  constexpr int num_elems = 16 / sizeof(nv_bfloat16);
+  constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
+  for (int iter = 0; iter < num_iters; iter ++){
+    const int idx = (iter * TB_SIZE + tid) * num_elems;
+    const int row = idx / WIDTH;
+    const int col = idx % HEIGHT;
+    
+    const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(
+      dst + (row * WIDTH + col) * sizeof(nv_bfloat16)
+    );
+    if(row < valid_height){
+      //有效行，执行异步拷贝
+      const nv_bfloat16 *src_addr = src + (row * src_stride + col);
+      asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;"
+        :: "r"(dst_addr), "l"(src_addr)
+      );
+    }
+    else{
+      asm volatile(
+        "{\n"
+        ".reg .v4 .b32 zeros;\n"
+        "mov.v4.b32 zeros, {0, 0, 0, 0};\n"
+        "st.shared.v4.b32 [%0], zeros;\n"
+        "}\n"
+        :: "r"(dst_addr)
+      );
+    }
   }
 }
 
