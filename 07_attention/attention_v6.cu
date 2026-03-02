@@ -100,12 +100,14 @@ void flash_atten_kernel(
     }
     __syncthreads();
 
-    float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
     float rowmax[WARP_Q / MMA_M][2];
     float rowsumexp[WARP_Q / MMA_M][2] = {};
-
+    for(int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q ++){
+            rowmax[mma_id_q][0] = -FLT_MAX;
+            rowmax[mma_id_q][1] = -FLT_MAX;
+        }
     for(int off_kv = 0; off_kv < kv_len; off_kv += BLOCK_KV){
-
+        float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
 
 
         int valid_rows = min(BLOCK_KV, kv_len - off_kv);
@@ -143,10 +145,6 @@ void flash_atten_kernel(
             }
         }
         for(int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q ++){
-            rowmax[mma_id_q][0] = -FLT_MAX;
-            rowmax[mma_id_q][1] = -FLT_MAX;
-        }
-        for(int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q ++){
             //apply softmax scale
             for(int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv ++){
                 for(int reg_id = 0; reg_id < 4; reg_id ++){
@@ -176,7 +174,7 @@ void flash_atten_kernel(
             float rescale[2];
             rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
             rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
-            for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d ++){
+            for(int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d ++){
                 O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
                 O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
                 O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
@@ -248,17 +246,28 @@ void flash_atten_kernel(
         for(int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d ++){
             const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
             float *regs = O_rmem[mma_id_q][mma_id_d];
-            const int global_row = q_block_id * BLOCK_Q + warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            // const int global_row = q_block_id * BLOCK_Q + warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
             regs[0] /= rowsumexp[mma_id_q][0];
             regs[1] /= rowsumexp[mma_id_q][0];
             regs[2] /= rowsumexp[mma_id_q][1];
             regs[3] /= rowsumexp[mma_id_q][1];
+            const int local_row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int global_row = q_block_id * BLOCK_Q + local_row;
+
             if(global_row < q_len){
-                reinterpret_cast<nv_bfloat162 *>(O + global_row * DIM + col)[0] = __float22bfloat162_rn({regs[0], regs[1]});
+                reinterpret_cast<nv_bfloat162*>(O + local_row * DIM + col)[0] = 
+                    __float22bfloat162_rn({regs[0], regs[1]});
             }
             if(global_row + 8 < q_len){
-                reinterpret_cast<nv_bfloat162 *>(O + (global_row + 8) * DIM + col)[0] = __float22bfloat162_rn({regs[2], regs[3]});
+                reinterpret_cast<nv_bfloat162*>(O + (local_row + 8) * DIM + col)[0] = 
+                    __float22bfloat162_rn({regs[2], regs[3]});
             }
+            // if(global_row < q_len){
+            //     reinterpret_cast<nv_bfloat162 *>(O + global_row * DIM + col)[0] = __float22bfloat162_rn({regs[0], regs[1]});
+            // }
+            // if(global_row + 8 < q_len){
+            //     reinterpret_cast<nv_bfloat162 *>(O + (global_row + 8) * DIM + col)[0] = __float22bfloat162_rn({regs[2], regs[3]});
+            // }
         }
     }
 }
@@ -300,11 +309,11 @@ void attention_v6(
     if(!is_gqa && q_head != kv_head){
         ERROR("not set gqa, but q_head and kv_head not equal: q_head is %d, kv_head is %d", q_head, kv_head);
     }
-    const int BLOCK_Q = 512;
-    const int BLOCK_KV = 512;
-    const int TB_SIZE = 512; // A100 can max support 1024 thread block
+    const int BLOCK_Q = 64;
+    const int BLOCK_KV = 64;
+    const int TB_SIZE = 128; // A100 can max support 1024 thread block
     const int WARP_SIZE = 32; // 32 threads per warp
-    const int NUM_WARPS = 16; // 512 / 32 = 16
+    const int NUM_WARPS = 4; // 128 / 32 = 4
     const int DIM = 64;
     // naive mha
     if(q_head == kv_head){
@@ -314,10 +323,21 @@ void attention_v6(
         }
         const int smem_size = max(BLOCK_Q, BLOCK_KV * 2) * DIM * sizeof(nv_bfloat16);
         float scale = 1.0f / sqrtf((float(DIM)));
+        cudaFuncSetAttribute(
+        flash_atten_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size
+    );
+
         flash_atten_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>
         <<<num_blocks, TB_SIZE, smem_size>>>(
             Q, K, V, O, scale, q_len, kv_len, bs, q_head
         );
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            printf("Kernel launch error: %s\n", cudaGetErrorString(err));
+        }
+
         return;
     }
 
