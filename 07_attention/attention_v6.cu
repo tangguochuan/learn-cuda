@@ -14,7 +14,9 @@ void flash_atten_kernel(
     int q_len,
     int kv_len,
     int bs,
-    int q_head
+    int q_head,
+    int kv_head,
+    int q_kv_ratio = 1
 ){
     constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
     const int bid = blockIdx.x;
@@ -24,12 +26,15 @@ void flash_atten_kernel(
 
     const int num_q_blocks = cdiv(q_len, BLOCK_Q);
     const int bs_id = bid / num_q_blocks;
+    const int batch_id = bs_id / q_head;
+    const int q_head_id = bs_id % q_head;
+    const int kv_head_id = q_head_id / q_kv_ratio;
     const int q_block_id = bid % num_q_blocks;
 
     //当前thread block要处理的初始位置
     Q += (bs_id * q_len *DIM + q_block_id * BLOCK_Q * DIM);
-    K += (bs_id * kv_len * DIM);
-    V += (bs_id * kv_len * DIM);
+    K += (batch_id * kv_head * kv_len * DIM + kv_head_id * kv_len * DIM);
+    V += (batch_id * kv_head * kv_len * DIM + kv_head_id * kv_len * DIM);
     O += (bs_id * q_len *DIM + q_block_id * BLOCK_Q * DIM);
 
     //因为Q只被加载一次，所以Q_smem和K_smem共用一块空间
@@ -237,8 +242,8 @@ void flash_atten_kernel(
                         V_rmem[mma_id_kv][mma_id_d],
                         O_rmem[mma_id_q][mma_id_d]);
 
-        K += BLOCK_KV * DIM;
-        V += BLOCK_KV * DIM;
+        K += valid_rows * DIM;
+        V += valid_rows * DIM;
     }
     
     // write to O
@@ -262,12 +267,6 @@ void flash_atten_kernel(
                 reinterpret_cast<nv_bfloat162*>(O + (local_row + 8) * DIM + col)[0] = 
                     __float22bfloat162_rn({regs[2], regs[3]});
             }
-            // if(global_row < q_len){
-            //     reinterpret_cast<nv_bfloat162 *>(O + global_row * DIM + col)[0] = __float22bfloat162_rn({regs[0], regs[1]});
-            // }
-            // if(global_row + 8 < q_len){
-            //     reinterpret_cast<nv_bfloat162 *>(O + (global_row + 8) * DIM + col)[0] = __float22bfloat162_rn({regs[2], regs[3]});
-            // }
         }
     }
 }
@@ -304,7 +303,7 @@ void attention_v6(
         ERROR("is_causal and atten_mask can't simutanounsly be true");
     }
     if (is_gqa && q_head % kv_head){
-        ERROR("set gqa, but q_head % kv_head not equal 0: q_head is %d, kv_head is %d", q_head, kv_head);
+        ERROR("set gqa, but q_head %% kv_head not equal 0: q_head is %d, kv_head is %d", q_head, kv_head);
     }
     if(!is_gqa && q_head != kv_head){
         ERROR("not set gqa, but q_head and kv_head not equal: q_head is %d, kv_head is %d", q_head, kv_head);
@@ -331,7 +330,7 @@ void attention_v6(
 
         flash_atten_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>
         <<<num_blocks, TB_SIZE, smem_size>>>(
-            Q, K, V, O, scale, q_len, kv_len, bs, q_head
+            Q, K, V, O, scale, q_len, kv_len, bs, q_head, kv_head
         );
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
