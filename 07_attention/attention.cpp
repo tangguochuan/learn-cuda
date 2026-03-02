@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <cuda_bf16.h>
+#include <pybind11/pybind11.h>
 
 // Forward declaration with full signature
 void attention_v6(
@@ -21,7 +22,8 @@ void attention_v6(
 at::Tensor sdpa_v6(
   const at::Tensor& Q,
   const at::Tensor& K,
-  const at::Tensor& V) {
+  const at::Tensor& V,
+  bool is_causal = false) {
 
   const int bs = Q.size(0);
   const int q_head = Q.size(1);
@@ -37,11 +39,11 @@ at::Tensor sdpa_v6(
   auto V_ptr = reinterpret_cast<const nv_bfloat16 *>(V.data_ptr());
   auto O_ptr = reinterpret_cast<nv_bfloat16 *>(O.data_ptr());
 
-  attention_v6(Q_ptr, K_ptr, V_ptr, O_ptr, bs, q_head, kv_head, len_q, len_kv, dim, nullptr, false, 0.0f, false);
+  attention_v6(Q_ptr, K_ptr, V_ptr, O_ptr, bs, q_head, kv_head, len_q, len_kv, dim, nullptr, is_causal, 0.0f, false);
 
   return O;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("sdpa_v6", &sdpa_v6);
+  m.def("sdpa_v6", &sdpa_v6, "sdpa_v6", py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("is_causal") = false);
 }
