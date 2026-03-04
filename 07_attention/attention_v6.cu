@@ -297,8 +297,8 @@ void flash_atten_kernel_causal(
     const int num_q_blocks = cdiv(q_len, BLOCK_Q);
     const int bs_id = bid / num_q_blocks; // bs_id :[0, batch_size * q_head )
     const int batch_id = bs_id / q_head;
-    const int q_head_id = batch_id % q_head;
-    const int kv_head_id = q_head / q_kv_ratio;
+    const int q_head_id = bs_id % q_head;
+    const int kv_head_id = q_head_id / q_kv_ratio;
     const int q_block_id = bid % num_q_blocks;
 
     // start position of current block that will process
@@ -342,10 +342,22 @@ void flash_atten_kernel_causal(
     // pre-compute address and swizzling for ldmatrix
     uint32_t Q_smem_thread, K_smem_thread, V_smem_thread;
     {
-        // A tile, 16 x 16
+        // A tile
         const int row_off = warp_id * WARP_Q + (lane_id % 16);
         const int col_off = lane_id / 16 * 8;
-        Q_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)>(Q_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
+        Q_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)> (Q_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
+    }
+    {
+        // B tile
+        const int row_off = lane_id % 8;
+        const int col_off = lane_id / 8 * 8;
+        K_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)> (K_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
+    }
+    {
+        // B tile trans
+        const int row_off = lane_id % 16;
+        const int col_off = lane_id / 16 * 8;
+        V_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)> (V_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
     }
     // shared -> registers
     // WARP_Q 可以被MMA_M整除
@@ -369,10 +381,10 @@ void flash_atten_kernel_causal(
         rowmax[i][0] = -FLT_MAX;
         rowmax[i][1] = -FLT_MAX;
     }
-    float O_rmem[WARP_Q / MMA_M][DIM / MMA_N][4];
+    float O_rmem[WARP_Q / MMA_M][DIM / MMA_N][4] = {};
     for(int off_kv = 0; off_kv < kv_len; off_kv += BLOCK_KV){
         // 当前warp的q完全注意不到此时的kv_block, 以及后面的kv_block
-        if(off_kv >= q_end + kv_len - q_len){
+        if(off_kv >= q_end){
             break;
         }
         int valid_kv_rows = min(BLOCK_KV, kv_len - off_kv);
@@ -394,7 +406,7 @@ void flash_atten_kernel_causal(
 
         float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
         //当前warp可以完全注意到此kv block
-        if(end_kv <= q_start + kv_len - q_len){
+        if(end_kv - 1 <= q_start){
             //shared -> registers
             for(int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv ++){
                 for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d ++){
@@ -419,9 +431,13 @@ void flash_atten_kernel_causal(
                     } //这里内存可以优化一下，对于每个mma_id_q, mma_id_kv, 只需要一个S即可
                     float *regs = S_rmem[mma_id_q][mma_id_kv];
                     for(int i = 0; i < 4; i++){
+                        regs[i] *= scale;
+                        int row_idx_mma = (lane_id >> 2) + 8 * (i >> 1);
+                        int row_idx_global = q_start + mma_id_q * MMA_M + row_idx_mma;
                         int col_idx_mma = (lane_id % 4) * 2 + (i & 0x1);
                         int col_idx_global = off_kv + mma_id_kv * MMA_N + col_idx_mma;
-                        if(col_idx_global >= kv_len){
+                        // causal mask + padding mask
+                        if(col_idx_global > row_idx_global || col_idx_global >= kv_len){
                             regs[i] = -FLT_MAX;
                         }
                     }
@@ -495,8 +511,8 @@ void flash_atten_kernel_causal(
                         mma_m16n8k16(
                             P_rmem[mma_id_q][mma_id_kv],
                             V_rmem[mma_id_kv][mma_id_d],
-                            O_rmem[mma_id_q][mma_id_d];
-                        )
+                            O_rmem[mma_id_q][mma_id_d]
+                        );
                     }
                 }
             }
@@ -527,17 +543,18 @@ void flash_atten_kernel_causal(
                             Q_rmem[mma_id_q][mma_id_d],
                             K_rmem[mma_id_kv][mma_id_d],
                             S_rmem[mma_id_q][mma_id_kv]
-                        )
+                        );
                     }
                     float* regs = S_rmem[mma_id_q][mma_id_kv];
                     for(int i = 0; i < 4; i++){
+                        regs[i] *= scale;
                         int row_idx_mma = (lane_id >> 2) + 8 * (i >> 1);
                         int row_idx_global =  q_start + mma_id_q * MMA_M + row_idx_mma;
                         int col_idx_mma = (lane_id % 4) * 2 + (i & 0x1);
                         int col_idx_global = off_kv + mma_id_kv * MMA_N + col_idx_mma;
 
                         // causal mask + padding mask
-                        if(col_idx_global > row_idx_global + kv_len - q_len || col_idx_global >= q_len){
+                        if(col_idx_global > row_idx_global || col_idx_global >= kv_len){
                             regs[i] = -FLT_MAX;
                         }
                     }
@@ -610,8 +627,8 @@ void flash_atten_kernel_causal(
                         mma_m16n8k16(
                             P_rmem[mma_id_q][mma_id_kv],
                             V_rmem[mma_id_kv][mma_id_d],
-                            O_rmem[mma_id_q][mma_id_d];
-                        )
+                            O_rmem[mma_id_q][mma_id_d]
+                        );
                     }
                 }
             }
