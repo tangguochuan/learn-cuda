@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--profile")
     parser.add_argument("--bs", type=int, default=4)
     parser.add_argument("--nh", type=int, default=8)
-    parser.add_argument("--kv", type=int, default=8)  # number of KV heads
+    parser.add_argument("--kv", type=int, default=2)  # number of KV heads
     parser.add_argument("--lq", type=int, default=4096)
     parser.add_argument("--lkv", type=int, default=8192)
     parser.add_argument("--causal", action="store_true")  # causal mask
@@ -138,7 +138,7 @@ def main():
             print(f"\nPyTorch fused:  {torch_latency_ms:.4f} ms, TFLOPS: {torch_tflops:.2f}")
 
             # Benchmark v6
-            latency_ms = do_bench(lambda: module.sdpa_v6(Q, K, V), return_mode="median")
+            latency_ms = do_bench(lambda: module.sdpa_v6(Q, K, V,args.causal), return_mode="median")
             tflops = 4 * bs * nh * lq * lkv * head_dim / latency_ms / 1e9
             print(f"v6:             {latency_ms:.4f} ms, TFLOPS: {tflops:.2f}")
             print(f"\nvs PyTorch:     {torch_latency_ms / latency_ms:.2f}x")
@@ -166,7 +166,9 @@ def main():
         tflops = 4 * bs * nh * lq * lkv * head_dim / latency_ms / 1e9
         pct_sol = tflops / sol * 100
         results.append([name, round(latency_ms, 4), round(tflops, 2), round(pct_sol, 2)])
-
+    print(f"Q shape: {Q.shape}")
+    print(f"K shape: {K.shape}")
+    print(f"V shape: {V.shape}")
     out_ref = F.scaled_dot_product_attention(Q, K, V)
 
     with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
