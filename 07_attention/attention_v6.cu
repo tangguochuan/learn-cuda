@@ -371,7 +371,7 @@ void flash_atten_kernel_causal(
     }
     //需不需要同步呢？
     __syncthreads();
-
+    int causal_offset = 0;
     // kv loop, each iteration, load a block of KV, do online softmax
     int q_start = q_block_id * BLOCK_Q + warp_id * WARP_Q;
     int q_end = q_start + min(WARP_Q, q_len -  q_start);
@@ -384,7 +384,7 @@ void flash_atten_kernel_causal(
     float O_rmem[WARP_Q / MMA_M][DIM / MMA_N][4] = {};
     for(int off_kv = 0; off_kv < kv_len; off_kv += BLOCK_KV){
         // 当前warp的q完全注意不到此时的kv_block, 以及后面的kv_block
-        if(off_kv >= q_end){
+        if(off_kv > q_end - 1 + causal_offset){
             break;
         }
         int valid_kv_rows = min(BLOCK_KV, kv_len - off_kv);
@@ -406,7 +406,7 @@ void flash_atten_kernel_causal(
 
         float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
         //当前warp可以完全注意到此kv block
-        if(end_kv - 1 <= q_start){
+        if(end_kv - 1 <= q_start + causal_offset){
             //shared -> registers
             for(int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv ++){
                 for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d ++){
@@ -437,7 +437,7 @@ void flash_atten_kernel_causal(
                         int col_idx_mma = (lane_id % 4) * 2 + (i & 0x1);
                         int col_idx_global = off_kv + mma_id_kv * MMA_N + col_idx_mma;
                         // causal mask + padding mask
-                        if(col_idx_global > row_idx_global || col_idx_global >= kv_len){
+                        if(col_idx_global > row_idx_global + causal_offset|| col_idx_global >= kv_len){
                             regs[i] = -FLT_MAX;
                         }
                     }
@@ -691,6 +691,9 @@ void attention_v6(
     if(is_causal && atten_mask){
         ERROR("is_causal and atten_mask can't simutanounsly be true");
     }
+    // [0, 4, 84, 6] : head_id:4, q_seq: 84, 
+    // thread_block: 4 * 2 + 1 = 9
+    // 84 - 64 = 20; 第 0 个warp
     const int BLOCK_Q = 64;
     const int BLOCK_KV = 64;
     const int TB_SIZE = 128; // A100 can max support 1024 thread block
@@ -730,6 +733,9 @@ void attention_v6(
         if (err != cudaSuccess) {
             printf("Kernel launch error: %s\n", cudaGetErrorString(err));
         }
+
+        // Synchronize for debugging
+        cudaDeviceSynchronize();
 
         return;
     
