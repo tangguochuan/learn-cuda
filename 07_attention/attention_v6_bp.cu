@@ -8,7 +8,7 @@ const nv_bfloat16 *Q,
     const nv_bfloat16 *K,
     const nv_bfloat16 *V,
     const nv_bfloat16 *O,
-    const nv_bfloat16 *L,
+    const float *L,
     const nv_bfloat16 *dO,
     nv_bfloat16 *dQ,
     nv_bfloat16 *d_temp_K, // [batch_size, q_head, kv_len, dim]
@@ -51,6 +51,7 @@ const nv_bfloat16 *Q,
     const uint32_t Q_smem = K_smem;
     const uint32_t V_smem = Q_smem + max(BLOCK_KV, BLOCK_Q) * DIM * sizeof(nv_bfloat16);
     const uint32_t L_smem = V_smem + BLOCK_KV * DIM * sizeof(nv_bfloat16);
+    const uint32_t dO_smem = L_smem + BLOCK_Q * sizeof(float);
     //for ldmatrix: 计算每个线程要load的行和列，并且要swizzle一下
     uint32_t Q_smem_thread, K_smem_thread, V_smem_thread;
     {
@@ -92,7 +93,7 @@ const nv_bfloat16 *Q,
     // TBD: modify V_rmem
     uint32_t V_rmem[WARP_KV / MMA_N][DIM / MMA_K][2];
 
-    // Load K registers: shared -> register
+    // Load K,V registers: shared -> register
     for(int mma_id_kv = 0; mma_id_kv < WARP_KV / MMA_N; mma_id_kv++){
         for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++){
             uint32_t addr = K_smem_thread;
@@ -101,28 +102,34 @@ const nv_bfloat16 *Q,
             ldmatrix_x2(
                 K_rmem[mma_id_kv][mma_id_d], addr
             );
+            ldmatrix_x2(V_rmem[mma_id_kv][mma_id_d], addr);
         }
     }
     uint32_t Q_rmem[BLOCK_Q / MMA_M][DIM / MMA_K][4];
-    // uint32_t dK_rmem;
-    // uint32_t dV_rmem
+    uint32_t dO_right_rmem[BLOCK_Q / MMA_K][DIM / MMA_N][2];
+    uint32_t dO_left_rmem[BLOCK_Q / MMA_M][DIM / MMA_K][4];
+    uint32_t P_rmem[BLOCK_Q / MMA_K][WARP_KV / MMA_M][4];
+
+    float dK_rmem[WARP_KV / MMA_M][DIM / MMA_N][4] = {};
+    float dV_rmem[WARP_KV / MMA_M][DIM / MMA_N][4] = {};
     int kv_start = kv_block_id * BLOCK_KV + WARP_KV * warp_id;
+
     for(int off_q = 0; off_q < q_len; off_q+= BLOCK_Q){
-        // dK，dV不用在smem中分配，直接分配在registers中
-        float dK_rmem[WARP_KV / MMA_N][DIM / MMA_K][2] = {};
-        float dV_rmem[WARP_KV / MMA_N][DIM / MMA_K][2] = {};
 
         //为S，P, L分配 registers
         float S_rmem[BLOCK_Q / MMA_M][WARP_KV / MMA_N][4] = {};
-        float P_rmem[BLOCK_Q / MMA_M][WARP_KV / MMA_N][4];
         float L_rmem[BLOCK_Q / MMA_M][2];
-        // Load Q: [BLOCK_Q, DIM] from HBM -> shared
+        float dP_rmem[BLOCK_Q / MMA_M][WARP_KV / MMA_N][4] = {};
+        // Load Q,dO: [BLOCK_Q, DIM] from HBM -> shared
         int q_valid_rows = min(BLOCK_Q, q_len - off_q);
         if(q_valid_rows == BLOCK_Q){
             global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid);
+            gloabl_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(dO_smem, dO, DIM, tid);
+
         }
         else{
             gloabl_to_shared_swizzle_padded<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid, q_valid_rows);
+            gloabl_to_shared_swizzle_padded<BLOCK_Q, DIM, TB_SIZE>(dO_smem, dO, DIM, tid, q_valid_rows); 
         }
         // Load L: [BLOCK_Q] from HBM -> shared
         for(int i = tid; i < BLOCK_Q; i += TB_SIZE){
@@ -138,13 +145,23 @@ const nv_bfloat16 *Q,
         asm volatile("cp.async.wait_all;");
         __syncthreads();
 
-        // Load Q: shared -> registers
+        // Load Q, O_rmem_left: shared -> registers
         for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_M; mma_id_q++){
             for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++){
                 uint32_t addr = Q_smem_thread;
                 addr += mma_id_q * MMA_M * DIM * sizeof(nv_bfloat16);
                 addr ^= mma_id_d * MMA_K * sizeof(nv_bfloat16);
                 ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
+                ldmatrix_x4(dO_left_rmem[mma_id_q][mma_id_d], addr);
+            }
+        }
+        // Load O_rmem_right: shared -> registers
+        for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_K; mma_id_q ++){
+            for(int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d ++){
+                uint32_t addr = V_smem_thread;
+                    addr += mma_id_q * MMA_K * DIM * sizeof(nv_bfloat16);
+                    addr ^= mma_id_d * MMA_N * sizeof(nv_bfloat16);
+                    ldmatrix_x2_trans(dO_right_rmem[mma_id_q][mma_id_d], addr);
             }
         }
 
@@ -171,9 +188,37 @@ const nv_bfloat16 *Q,
                         // 为了节省现存，S和P复用
                         S_rmem[mma_id_q][mma_id_kv][i] = __expf(S_rmem[mma_id_q][mma_id_kv][i] - L_smem[row_id]);
                     }
+                    float *regs = S_rmem[mma_id_q][mma_id_kv];
+                    nv_bfloat162* this_P_rmem = reinterpret_cast<nv_bfloat162 *>(P_rmem[mma_id_q][mma_id_kv / 2]);
+                    this_P_rmem[(mma_id_kv % 2) * 2] = __float22bfloat162_rn({regs[0], regs[1]});
+                    this_P_rmem[(mma_id_kv % 2) * 2 + 1] == __float22bfloat162_rn({regs[2], regs[3]});
                 }
             }
-
+        // [k, m] * [k, n]
+        // dV += P.T @ dO_right ,P:[BLOCK_Q, BLOCK_KV], O_right: [BLOCK_Q, DIM]
+        for(int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv ++){
+            for(int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++){
+                for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_K; mma_id_q++){
+                    mma_m16n8k16_inverse(
+                        P_rmem[mma_id_q][mma_id_kv],
+                        dO_right_rmem[mma_id_q][mma_id_d],
+                        dV_rmem[mma_id_kv][mma_id_d]
+                    );
+                }
+            }
+        }
+        // dP = dO @ V.T
+        for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_M; mma_id_q++){
+            for(int mma_id_kv = 0; mma_id_kv < WARP_KV / MMA_N; mma_id_kv++){
+                for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++){
+                    mma_m16n8k16(
+                        dO_left_rmem[mma_id_q][mma_id_d],
+                        V_rmem[mma_id_kv][mma_id_d],
+                        dP_rmem[mma_id_q][mma_id_kv]
+                    );
+                }
+            }
+        }
     }
 }
 
