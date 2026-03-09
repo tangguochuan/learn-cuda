@@ -31,19 +31,9 @@ __global__ void float_to_bf16_kernel(const float *src, nv_bfloat16 *dst, int n) 
 }
 
 // Helper: write a fragment value to swizzled smem as bf16
-// base_addr: shared memory base address (uint32_t from cvta.to.shared)
-// stride: number of bf16 elements per row
-// row, col: position in the matrix
-// val: float value to store
+// This function is not used in current implementation
 __device__ inline
-void store_bf16_swizzled(uint32_t base_addr, int stride, int row, int col, float val) {
-    uint32_t addr = swizzle<64 * sizeof(nv_bfloat16)>(
-        base_addr + (row * stride + col) * sizeof(nv_bfloat16));
-    asm volatile("st.shared.b16 [%0], %1;" :: "r"(addr), "h"(__bfloat162float(__float2bfloat16(val))));
-}
-
-// Actually, st.shared.b16 needs a 16-bit register. Let's use a simpler approach:
-// Write bf16 through a pointer computed from the swizzled address.
+void store_bf16_swizzled_placeholder() {}
 
 // Generic MMA matmul: C += A_smem @ B_smem^T
 // A is [M_per_warp=16, K_total] in A_smem with A_stride
@@ -68,14 +58,14 @@ void mma_AB_T(
             else if (lane_id < 24) ld_row = A_row_start + (lane_id - 16);
             else                   ld_row = A_row_start + 8 + (lane_id - 24);
 
-            uint32_t A_addr = swizzle<A_stride * (int)sizeof(nv_bfloat16)>(
+            uint32_t A_addr = swizzle<128>(
                 A_smem_addr + (ld_row * A_stride + k * 16) * sizeof(nv_bfloat16));
             uint32_t A_frag[4];
             ldmatrix_x4(A_frag, A_addr);
 
             // Load B: transposed, 8 rows from B_smem
             int b_row = n * 8 + (lane_id % 8);
-            uint32_t B_addr = swizzle<B_stride * (int)sizeof(nv_bfloat16)>(
+            uint32_t B_addr = swizzle<128>(
                 B_smem_addr + (b_row * B_stride + k * 16) * sizeof(nv_bfloat16));
             uint32_t B_frag[2];
             ldmatrix_x2_trans(B_frag, B_addr);
@@ -83,6 +73,12 @@ void mma_AB_T(
             mma_m16n8k16(A_frag, B_frag, C_frag[n]);
         }
     }
+}
+
+// Store a bf16 value to shared memory via asm (avoids 32->64 bit pointer cast issue)
+__device__ inline
+void st_shared_bf16(uint32_t addr, nv_bfloat16 val) {
+    asm volatile("st.shared.b16 [%0], %1;" :: "r"(addr), "h"(*(uint16_t*)&val));
 }
 
 // Write C/D fragment to smem as [ROWS, COLS] with swizzle (row-major)
@@ -120,10 +116,10 @@ void frag_to_smem_row(
         uint32_t a3 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
             smem_addr + (r1 * stride + c1) * sizeof(nv_bfloat16));
 
-        *(nv_bfloat16*)a0 = v0;
-        *(nv_bfloat16*)a1 = v1;
-        *(nv_bfloat16*)a2 = v2;
-        *(nv_bfloat16*)a3 = v3;
+        st_shared_bf16(a0, v0);
+        st_shared_bf16(a1, v1);
+        st_shared_bf16(a2, v2);
+        st_shared_bf16(a3, v3);
     }
 }
 
@@ -158,10 +154,10 @@ void frag_to_smem_transpose(
         uint32_t a3 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
             smem_addr + (kv1 * stride + q1) * sizeof(nv_bfloat16));
 
-        *(nv_bfloat16*)a0 = v0;
-        *(nv_bfloat16*)a1 = v1;
-        *(nv_bfloat16*)a2 = v2;
-        *(nv_bfloat16*)a3 = v3;
+        st_shared_bf16(a0, v0);
+        st_shared_bf16(a1, v1);
+        st_shared_bf16(a2, v2);
+        st_shared_bf16(a3, v3);
     }
 }
 
@@ -182,8 +178,9 @@ __global__ void flash_attention_backward_kernel(
     constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
     constexpr int STRIDE = 64; // all matrices are 64-wide
 
-    int kv_block_idx = blockIdx.x;
-    int batch_kv_head = blockIdx.y;
+    int num_kv_blocks = cdiv(kv_len, BLOCK_KV);
+    int kv_block_idx = blockIdx.x % num_kv_blocks;
+    int batch_kv_head = blockIdx.x / num_kv_blocks;
     int batch_idx = batch_kv_head / kv_head;
     int kv_head_idx = batch_kv_head % kv_head;
 
@@ -200,17 +197,11 @@ __global__ void flash_attention_backward_kernel(
     extern __shared__ char smem[];
     constexpr int BLK_SIZE = 64 * 64 * sizeof(nv_bfloat16); // 8KB
 
-    uint32_t K_s_addr, V_s_addr, BufA_addr, BufB_addr;
-    {
-        nv_bfloat16 *K_s = reinterpret_cast<nv_bfloat16*>(smem);
-        nv_bfloat16 *V_s = reinterpret_cast<nv_bfloat16*>(smem + BLK_SIZE);
-        nv_bfloat16 *BufA = reinterpret_cast<nv_bfloat16*>(smem + 2 * BLK_SIZE);
-        nv_bfloat16 *BufB = reinterpret_cast<nv_bfloat16*>(smem + 3 * BLK_SIZE);
-        asm("cvta.to.shared.u32 %0, %1;" : "=r"(K_s_addr) : "l"(K_s));
-        asm("cvta.to.shared.u32 %0, %1;" : "=r"(V_s_addr) : "l"(V_s));
-        asm("cvta.to.shared.u32 %0, %1;" : "=r"(BufA_addr) : "l"(BufA));
-        asm("cvta.to.shared.u32 %0, %1;" : "=r"(BufB_addr) : "l"(BufB));
-    }
+    nv_bfloat16 *smem_bf16 = reinterpret_cast<nv_bfloat16*>(smem);
+    const uint32_t K_s_addr = __cvta_generic_to_shared(smem_bf16);
+    const uint32_t V_s_addr = __cvta_generic_to_shared(smem_bf16 + BLK_SIZE / sizeof(nv_bfloat16));
+    const uint32_t BufA_addr = __cvta_generic_to_shared(smem_bf16 + 2 * BLK_SIZE / sizeof(nv_bfloat16));
+    const uint32_t BufB_addr = __cvta_generic_to_shared(smem_bf16 + 3 * BLK_SIZE / sizeof(nv_bfloat16));
 
     // Load K_j, V_j to smem
     const nv_bfloat16 *K_base = K + ((size_t)batch_idx * kv_head * kv_len + kv_head_idx * kv_len + kv_start) * head_dim;
@@ -437,21 +428,21 @@ void attention_v6_backward(
     // Launch backward kernel
     constexpr int BLOCK_Q = 64, BLOCK_KV = 64, DIM = 64, NUM_WARPS = 4;
     int num_kv_blocks = cdiv(kv_len, BLOCK_KV);
-    dim3 grid(num_kv_blocks, batch_size * kv_head);
+    int num_blocks = num_kv_blocks * batch_size * kv_head;
     int block_size = NUM_WARPS * WARP_SIZE;
     int smem_size = 4 * BLOCK_KV * DIM * sizeof(nv_bfloat16); // 32KB
 
     if (is_causal) {
         launch_kernel(
             flash_attention_backward_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, true>,
-            grid, block_size, smem_size,
+            num_blocks, block_size, smem_size,
             Q, K, V, L_float, dO, D, dQ_acc, dK_acc, dV_acc,
             batch_size, q_head, kv_head, q_len, kv_len, head_dim,
             q_kv_ratio, 1.0f / sqrtf((float)head_dim));
     } else {
         launch_kernel(
             flash_attention_backward_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, false>,
-            grid, block_size, smem_size,
+            num_blocks, block_size, smem_size,
             Q, K, V, L_float, dO, D, dQ_acc, dK_acc, dV_acc,
             batch_size, q_head, kv_head, q_len, kv_len, head_dim,
             q_kv_ratio, 1.0f / sqrtf((float)head_dim));

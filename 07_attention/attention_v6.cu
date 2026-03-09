@@ -10,6 +10,7 @@ void flash_atten_kernel(
     const nv_bfloat16 *K,
     const nv_bfloat16 *V,
     nv_bfloat16 *O,
+    nv_bfloat16 *L_out,  // [bs * q_head * q_len], logsumexp per row
     const float scale,
     int q_len,
     int kv_len,
@@ -36,6 +37,7 @@ void flash_atten_kernel(
     K += (batch_id * kv_head * kv_len * DIM + kv_head_id * kv_len * DIM);
     V += (batch_id * kv_head * kv_len * DIM + kv_head_id * kv_len * DIM);
     O += (bs_id * q_len *DIM + q_block_id * BLOCK_Q * DIM);
+    L_out += (bs_id * q_len + q_block_id * BLOCK_Q);
 
     //因为Q只被加载一次，所以Q_smem和K_smem共用一块空间
     // Q_smem: (BLOCK_Q,DIM)
@@ -264,9 +266,20 @@ void flash_atten_kernel(
                     __float22bfloat162_rn({regs[0], regs[1]});
             }
             if(global_row + 8 < q_len){
-                reinterpret_cast<nv_bfloat162*>(O + (local_row + 8) * DIM + col)[0] = 
+                reinterpret_cast<nv_bfloat162*>(O + (local_row + 8) * DIM + col)[0] =
                     __float22bfloat162_rn({regs[2], regs[3]});
             }
+        }
+        // write L = rowmax + log(rowsumexp), 每行只需一个线程写
+        if ((lane_id & 3) == 0) {
+            const int local_row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int global_row = q_block_id * BLOCK_Q + local_row;
+            if (global_row < q_len)
+                L_out[local_row] = __float2bfloat16(
+                    rowmax[mma_id_q][0] + logf(rowsumexp[mma_id_q][0]));
+            if (global_row + 8 < q_len)
+                L_out[local_row + 8] = __float2bfloat16(
+                    rowmax[mma_id_q][1] + logf(rowsumexp[mma_id_q][1]));
         }
     }
 }
@@ -278,6 +291,7 @@ void flash_atten_kernel_causal(
     const nv_bfloat16 *K,
     const nv_bfloat16 *V,
     nv_bfloat16 *O,
+    nv_bfloat16 *L_out,
     const float scale,
     int q_len,
     int kv_len,
@@ -308,6 +322,7 @@ void flash_atten_kernel_causal(
     K += (batch_id * kv_head * kv_len * DIM + kv_head_id * kv_len * DIM);
     V += (batch_id * kv_head * kv_len * DIM + kv_head_id * kv_len * DIM);
     O += (bs_id * q_len * DIM + q_block_id * BLOCK_Q * DIM);
+    L_out += (bs_id * q_len + q_block_id * BLOCK_Q);
 
     // mma m16n8k16
     const int MMA_M = 16;
@@ -653,9 +668,20 @@ void flash_atten_kernel_causal(
                     __float22bfloat162_rn({regs[0], regs[1]});
             }
             if(global_row + 8 < q_len){
-                reinterpret_cast<nv_bfloat162*>(O + (local_row + 8) * DIM + col)[0] = 
+                reinterpret_cast<nv_bfloat162*>(O + (local_row + 8) * DIM + col)[0] =
                     __float22bfloat162_rn({regs[2], regs[3]});
             }
+        }
+        // write L = rowmax + log(rowsumexp)
+        if ((lane_id & 3) == 0) {
+            const int local_row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
+            const int global_row = q_block_id * BLOCK_Q + local_row;
+            if (global_row < q_len)
+                L_out[local_row] = __float2bfloat16(
+                    rowmax[mma_id_q][0] + logf(rowsumexp[mma_id_q][0]));
+            if (global_row + 8 < q_len)
+                L_out[local_row + 8] = __float2bfloat16(
+                    rowmax[mma_id_q][1] + logf(rowsumexp[mma_id_q][1]));
         }
     }
 }
@@ -676,6 +702,7 @@ void attention_v6(
     const nv_bfloat16 *K,
     const nv_bfloat16 *V,
     nv_bfloat16 *O,
+    nv_bfloat16 *L_out,  // [bs * q_head * q_len]
     int bs,
     int q_head,
     int kv_head,
@@ -715,7 +742,7 @@ void attention_v6(
         );
         flash_atten_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>
         <<<num_blocks, TB_SIZE, smem_size>>>(
-            Q, K, V, O, scale, q_len, kv_len, bs, q_head, kv_head, q_head / kv_head
+            Q, K, V, O, L_out, scale, q_len, kv_len, bs, q_head, kv_head, q_head / kv_head
         );
         }
         else{
@@ -726,7 +753,7 @@ void attention_v6(
         );
         flash_atten_kernel_causal<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>
         <<<num_blocks, TB_SIZE, smem_size>>>(
-            Q, K, V, O, scale, q_len, kv_len, bs, q_head, kv_head, q_head / kv_head
+            Q, K, V, O, L_out, scale, q_len, kv_len, bs, q_head, kv_head, q_head / kv_head
         );
         }
         cudaError_t err = cudaGetLastError();

@@ -2,6 +2,17 @@
 #include <cuda_bf16.h>
 #include <pybind11/pybind11.h>
 
+void attention_v6(
+  const nv_bfloat16 *Q,
+  const nv_bfloat16 *K,
+  const nv_bfloat16 *V,
+  nv_bfloat16 *O,
+  nv_bfloat16 *L_out,
+  int bs, int q_head, int kv_head,
+  int q_len, int kv_len, int head_dim,
+  const nv_bfloat16 *atten_mask,
+  bool is_causal, float dropout_p, bool is_gqa);
+
 void attention_v6_backward(
   const nv_bfloat16 *Q,
   const nv_bfloat16 *K,
@@ -20,6 +31,36 @@ void attention_v6_backward(
   int head_dim,
   bool is_causal);
 
+// Forward: returns [O, L]
+std::vector<at::Tensor> sdpa_v6_forward(
+  const at::Tensor& Q,
+  const at::Tensor& K,
+  const at::Tensor& V,
+  bool is_causal) {
+
+  const int bs = Q.size(0);
+  const int q_head = Q.size(1);
+  const int len_q = Q.size(2);
+  const int kv_head = K.size(1);
+  const int len_kv = K.size(2);
+  const int dim = Q.size(3);
+
+  at::Tensor O = at::empty_like(Q);
+  at::Tensor L = at::empty({bs, q_head, len_q}, Q.options());
+
+  attention_v6(
+    reinterpret_cast<const nv_bfloat16 *>(Q.data_ptr()),
+    reinterpret_cast<const nv_bfloat16 *>(K.data_ptr()),
+    reinterpret_cast<const nv_bfloat16 *>(V.data_ptr()),
+    reinterpret_cast<nv_bfloat16 *>(O.data_ptr()),
+    reinterpret_cast<nv_bfloat16 *>(L.data_ptr()),
+    bs, q_head, kv_head, len_q, len_kv, dim,
+    nullptr, is_causal, 0.0f, (q_head != kv_head));
+
+  return {O, L};
+}
+
+// Backward: returns [dQ, dK, dV]
 std::vector<at::Tensor> sdpa_v6_bp(
   const at::Tensor& Q,
   const at::Tensor& K,
@@ -56,6 +97,9 @@ std::vector<at::Tensor> sdpa_v6_bp(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("sdpa_v6_forward", &sdpa_v6_forward, "sdpa_v6_forward",
+    py::arg("Q"), py::arg("K"), py::arg("V"),
+    py::arg("is_causal") = false);
   m.def("sdpa_v6_bp", &sdpa_v6_bp, "sdpa_v6_backward",
     py::arg("Q"), py::arg("K"), py::arg("V"),
     py::arg("O"), py::arg("L"), py::arg("dO"),
