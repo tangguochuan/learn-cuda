@@ -1,242 +1,391 @@
 #include <cuda_bf16.h>
 #include "common.h"
 
-// no gqa + no causal
-template <int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS>
-__global__ void flash_atten_bakward_1(
-const nv_bfloat16 *Q,
-    const nv_bfloat16 *K,
-    const nv_bfloat16 *V,
-    const nv_bfloat16 *O,
-    const float *L,
-    const nv_bfloat16 *dO,
-    nv_bfloat16 *dQ,
-    nv_bfloat16 *d_temp_K, // [batch_size, q_head, kv_len, dim]
-    nv_bfloat16 *d_temp_V, // [batch_size, q_head, kv_len, dim]
-    int bs,
-    int q_head,
-    int kv_head,
-    int q_len,
-    int kv_len,
-    int head_dim,
-    int q_kv_ratio = 1
-){
-    //basic information
-    constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
-    const int bid = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int warp_id = tid / WARP_SIZE;
-    const int lane_id = tid % WARP_SIZE;
-    const int num_kv_blocks = cdiv(kv_len, BLOCK_KV);
-    const int bs_id = bid / num_kv_blocks;
-    const int batch_id = bs_id / q_head;
-    const int q_head_id = bs_id % q_head;
-    const int kv_head_id = q_head / q_kv_ratio;
-    const int kv_block_id = bid % num_kv_blocks;
-    const int WARP_KV = BLOCK_KV / NUM_WARPS;
-    //当前thread block要处理的初始位置
-    Q += (batch_id * q_head * q_len * DIM + q_head_id * q_len * DIM); // process [q_len, DIM]
-    K += (batch_id * kv_head * kv_len * DIM + kv_head_id * kv_len * DIM + kv_block_id * BLOCK_KV * DIM); // process [BLOCK_KV, DIM]
-    V += (batch_id * kv_head * kv_len * DIM + kv_head_id * kv_len * DIM + kv_block_id * BLOCK_KV * DIM); // process [BLOCK_KV, DIM]
-    O += (batch_id * q_head * q_len * DIM + q_head_id * q_len * DIM); // process [q_len, DIM]
-    dO += (batch_id * q_head * q_len * DIM + q_head_id * q_len * DIM); // process [q_len, DIM]
-    d_temp_K += (batch_id * q_head * kv_len * DIM + q_head_id * kv_len * DIM + kv_block_id * BLOCK_KV * DIM); // process [BLOCK_KV, DIM]
-    d_temp_V += (batch_id * q_head * kv_len * DIM + q_head_id * kv_len * DIM + kv_block_id * BLOCK_KV * DIM); // process [BLOCK_KV, DIM]
-    L += (batch_id * q_head * q_len + q_head_id * q_len); //process [q_len,]
+// D_i = rowsum(dO_i * O_i)
+__global__ void compute_D_kernel(
+    const nv_bfloat16 *O, const nv_bfloat16 *dO, float *D,
+    int q_head, int q_len, int head_dim)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int batch_head = blockIdx.y; // bs * q_head
+    if (row >= q_len) return;
 
-    // Load K, V HBM -> SRAM [BLOCK_KV, DIM]
-    // initialize dK,dV: [BLOCK_KV, DIM]
-    extern __shared__ nv_bfloat16 smem[];
-    const uint32_t K_smem = __cvta_generic_to_shared(smem);
-    const uint32_t Q_smem = K_smem;
-    const uint32_t V_smem = Q_smem + max(BLOCK_KV, BLOCK_Q) * DIM * sizeof(nv_bfloat16);
-    const uint32_t L_smem = V_smem + BLOCK_KV * DIM * sizeof(nv_bfloat16);
-    const uint32_t dO_smem = L_smem + BLOCK_Q * sizeof(float);
-    //for ldmatrix: 计算每个线程要load的行和列，并且要swizzle一下
-    uint32_t Q_smem_thread, K_smem_thread, V_smem_thread;
-    {
-        // A tile
-        const int row_off = warp_id * WARP_Q + (lane_id % 16);
-        const int col_off = lane_id / 16 * 8;
-        Q_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)> (Q_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
-    }
-    {
-        // B tile
-        const int row_off = lane_id % 8;
-        const int col_off = lane_id / 8 * 8;
-        K_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)> (K_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
-    }
-    {
-        // B tile trans
-        const int row_off = lane_id % 16;
-        const int col_off = lane_id / 16 * 8;
-        V_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)> (V_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
-    }
-    const int kv_valid_rows = min(BLOCK_KV, kv_len - kv_block_id * BLOCK_KV);
-    if(kv_valid_rows == BLOCK_KV){
-        gloabl_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(K_smem, K, DIM, tid);
-        global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(V_smem, V, DIM, tid);
-    }
-    else{
-        gloabl_to_shared_swizzle_padded<BLOCK_KV, DIM, TB_SIZE>(K_smem, K, DIM, tid, kv_valid_rows);
-        gloabl_to_shared_swizzle_padded<BLOCK_KV, DIM, TB_SIZE>(V_smem, V, DIM, tid, kv_valid_rows);
-    }
-    asm volatile("cp.async.commit_group;");
-    asm volatile("cp.async.wait_all;");
-    __syncthreads();
+    int base = batch_head * q_len * head_dim;
+    float sum = 0.0f;
+    for (int d = 0; d < head_dim; d++)
+        sum += __bfloat162float(O[base + row * head_dim + d]) *
+               __bfloat162float(dO[base + row * head_dim + d]);
+    D[batch_head * q_len + row] = sum;
+}
 
-    // K,V,dK, dV: shared -> registers
-    const int MMA_M = 16;
-    const int MMA_K = 16;
-    const int MMA_N = 8;
-    uint32_t K_rmem[WARP_KV / MMA_N][DIM / MMA_K][2];
-    // TBD: modify V_rmem
-    uint32_t V_rmem[WARP_KV / MMA_N][DIM / MMA_K][2];
+// bf16 -> float conversion kernel
+__global__ void bf16_to_float_kernel(const nv_bfloat16 *src, float *dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __bfloat162float(src[idx]);
+}
 
-    // Load K,V registers: shared -> register
-    for(int mma_id_kv = 0; mma_id_kv < WARP_KV / MMA_N; mma_id_kv++){
-        for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++){
-            uint32_t addr = K_smem_thread;
-            addr += mma_id_kv * MMA_N * DIM *sizeof(nv_bfloat16);
-            addr ^= mma_id_d * MMA_K * sizeof(nv_bfloat16);
-            ldmatrix_x2(
-                K_rmem[mma_id_kv][mma_id_d], addr
-            );
-            ldmatrix_x2(V_rmem[mma_id_kv][mma_id_d], addr);
-        }
-    }
-    uint32_t Q_rmem[BLOCK_Q / MMA_M][DIM / MMA_K][4];
-    uint32_t dO_right_rmem[BLOCK_Q / MMA_K][DIM / MMA_N][2];
-    uint32_t dO_left_rmem[BLOCK_Q / MMA_M][DIM / MMA_K][4];
-    uint32_t P_rmem[BLOCK_Q / MMA_K][WARP_KV / MMA_M][4];
+// float -> bf16 conversion kernel
+__global__ void float_to_bf16_kernel(const float *src, nv_bfloat16 *dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __float2bfloat16(src[idx]);
+}
 
-    float dK_rmem[WARP_KV / MMA_M][DIM / MMA_N][4] = {};
-    float dV_rmem[WARP_KV / MMA_M][DIM / MMA_N][4] = {};
-    int kv_start = kv_block_id * BLOCK_KV + WARP_KV * warp_id;
+// Helper: write a fragment value to swizzled smem as bf16
+// base_addr: shared memory base address (uint32_t from cvta.to.shared)
+// stride: number of bf16 elements per row
+// row, col: position in the matrix
+// val: float value to store
+__device__ inline
+void store_bf16_swizzled(uint32_t base_addr, int stride, int row, int col, float val) {
+    uint32_t addr = swizzle<64 * sizeof(nv_bfloat16)>(
+        base_addr + (row * stride + col) * sizeof(nv_bfloat16));
+    asm volatile("st.shared.b16 [%0], %1;" :: "r"(addr), "h"(__bfloat162float(__float2bfloat16(val))));
+}
 
-    for(int off_q = 0; off_q < q_len; off_q+= BLOCK_Q){
+// Actually, st.shared.b16 needs a 16-bit register. Let's use a simpler approach:
+// Write bf16 through a pointer computed from the swizzled address.
 
-        //为S，P, L分配 registers
-        float S_rmem[BLOCK_Q / MMA_M][WARP_KV / MMA_N][4] = {};
-        float L_rmem[BLOCK_Q / MMA_M][2];
-        float dP_rmem[BLOCK_Q / MMA_M][WARP_KV / MMA_N][4] = {};
-        // Load Q,dO: [BLOCK_Q, DIM] from HBM -> shared
-        int q_valid_rows = min(BLOCK_Q, q_len - off_q);
-        if(q_valid_rows == BLOCK_Q){
-            global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid);
-            gloabl_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(dO_smem, dO, DIM, tid);
+// Generic MMA matmul: C += A_smem @ B_smem^T
+// A is [M_per_warp=16, K_total] in A_smem with A_stride
+// B is [N_tile*8, K_total] in B_smem with B_stride (loaded transposed)
+// Result in C_frag[N_tiles][4]
+// warp_id selects which 16 rows of A
+template <int K_TOTAL, int N_TILES>
+__device__ inline
+void mma_AB_T(
+    float C_frag[N_TILES][4],
+    uint32_t A_smem_addr, int A_stride, int A_row_start,
+    uint32_t B_smem_addr, int B_stride,
+    int lane_id)
+{
+    for (int n = 0; n < N_TILES; n++) {
+        for (int k = 0; k < K_TOTAL / 16; k++) {
+            // Load A: 16x16 tile from A_smem
+            int ld_row;
+            int lid8 = lane_id & 7;
+            if (lane_id < 8)       ld_row = A_row_start + lid8;
+            else if (lane_id < 16) ld_row = A_row_start + 8 + lid8;
+            else if (lane_id < 24) ld_row = A_row_start + (lane_id - 16);
+            else                   ld_row = A_row_start + 8 + (lane_id - 24);
 
-        }
-        else{
-            gloabl_to_shared_swizzle_padded<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid, q_valid_rows);
-            gloabl_to_shared_swizzle_padded<BLOCK_Q, DIM, TB_SIZE>(dO_smem, dO, DIM, tid, q_valid_rows); 
-        }
-        // Load L: [BLOCK_Q] from HBM -> shared
-        for(int i = tid; i < BLOCK_Q; i += TB_SIZE){
-            int idx = i + off_q;
-            if(idx < q_len){
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 4;"
-                : "r"(&L_smem[i])
-                : "l"(&L[idx]));
-            }
-        }
-        
-        asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_all;");
-        __syncthreads();
+            uint32_t A_addr = swizzle<A_stride * (int)sizeof(nv_bfloat16)>(
+                A_smem_addr + (ld_row * A_stride + k * 16) * sizeof(nv_bfloat16));
+            uint32_t A_frag[4];
+            ldmatrix_x4(A_frag, A_addr);
 
-        // Load Q, O_rmem_left: shared -> registers
-        for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_M; mma_id_q++){
-            for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++){
-                uint32_t addr = Q_smem_thread;
-                addr += mma_id_q * MMA_M * DIM * sizeof(nv_bfloat16);
-                addr ^= mma_id_d * MMA_K * sizeof(nv_bfloat16);
-                ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
-                ldmatrix_x4(dO_left_rmem[mma_id_q][mma_id_d], addr);
-            }
-        }
-        // Load O_rmem_right: shared -> registers
-        for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_K; mma_id_q ++){
-            for(int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d ++){
-                uint32_t addr = V_smem_thread;
-                    addr += mma_id_q * MMA_K * DIM * sizeof(nv_bfloat16);
-                    addr ^= mma_id_d * MMA_N * sizeof(nv_bfloat16);
-                    ldmatrix_x2_trans(dO_right_rmem[mma_id_q][mma_id_d], addr);
-            }
-        }
+            // Load B: transposed, 8 rows from B_smem
+            int b_row = n * 8 + (lane_id % 8);
+            uint32_t B_addr = swizzle<B_stride * (int)sizeof(nv_bfloat16)>(
+                B_smem_addr + (b_row * B_stride + k * 16) * sizeof(nv_bfloat16));
+            uint32_t B_frag[2];
+            ldmatrix_x2_trans(B_frag, B_addr);
 
-        // recompute: S = Q @ K.T
-        for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_M; mma_id_q ++){
-            for(int mma_id_kv = 0; mma_id_kv < WARP_KV / MMA_N; mma_id_kv++){
-                for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++){
-                    mma_m16n8k16(Q_rmem[mma_id_q][mma_id_d], K_rmem[mma_id_kv][mma_id_d],
-                    S_rmem[mma_id_q][mma_id_kv]);
-                }
-            }
-        }
-        // apply padding mask to KV and get P (overlap S)
-            for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_M; mma_id_q++){
-                for(int mma_id_kv = 0; mma_id_kv < WARP_KV / MMA_N; mma_id_kv++){
-                    for(int i = 0; i < 4; i++){
-                        int mma_col = (lane_id % 4) * 2 + (i & 0x1);
-                        int kv_idx = kv_start + mma_id_kv * MMA_N + mma_col;
-                        if(kv_idx >= kv_len){
-                            S_rmem[mma_id_q][mma_id_kv][i] = -FLT_MAX;
-                        }
-                        //row_id within BLOCK_Q
-                        int row_id = mma_id_q * MMA_M + (lane_id >> 2) + 8 * (i >= 2);
-                        // 为了节省现存，S和P复用
-                        S_rmem[mma_id_q][mma_id_kv][i] = __expf(S_rmem[mma_id_q][mma_id_kv][i] - L_smem[row_id]);
-                    }
-                    float *regs = S_rmem[mma_id_q][mma_id_kv];
-                    nv_bfloat162* this_P_rmem = reinterpret_cast<nv_bfloat162 *>(P_rmem[mma_id_q][mma_id_kv / 2]);
-                    this_P_rmem[(mma_id_kv % 2) * 2] = __float22bfloat162_rn({regs[0], regs[1]});
-                    this_P_rmem[(mma_id_kv % 2) * 2 + 1] == __float22bfloat162_rn({regs[2], regs[3]});
-                }
-            }
-        // [k, m] * [k, n]
-        // dV += P.T @ dO_right ,P:[BLOCK_Q, BLOCK_KV], O_right: [BLOCK_Q, DIM]
-        for(int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv ++){
-            for(int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++){
-                for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_K; mma_id_q++){
-                    mma_m16n8k16_inverse(
-                        P_rmem[mma_id_q][mma_id_kv],
-                        dO_right_rmem[mma_id_q][mma_id_d],
-                        dV_rmem[mma_id_kv][mma_id_d]
-                    );
-                }
-            }
-        }
-        // dP = dO @ V.T
-        for(int mma_id_q = 0; mma_id_q < BLOCK_Q / MMA_M; mma_id_q++){
-            for(int mma_id_kv = 0; mma_id_kv < WARP_KV / MMA_N; mma_id_kv++){
-                for(int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++){
-                    mma_m16n8k16(
-                        dO_left_rmem[mma_id_q][mma_id_d],
-                        V_rmem[mma_id_kv][mma_id_d],
-                        dP_rmem[mma_id_q][mma_id_kv]
-                    );
-                }
-            }
+            mma_m16n8k16(A_frag, B_frag, C_frag[n]);
         }
     }
 }
 
-/**
- * @brief flash attention backward的入口函数
- * @param[in] Q (bs, q_head, q_len, head_dim)
- * @param[in] K (bs, kv_head, kv_len, head_dim)
- * @param[in] V (bs, kv_head, kv_len, head_dim)
- * @param[in] O (bs, q_head, q_len, head_dim)
- * @param[in] L (bs, q_head, q_len)
- * @param[in] dO same shape as O
- */
+// Write C/D fragment to smem as [ROWS, COLS] with swizzle (row-major)
+// Fragment layout: c0->(group_id, tid_in_group*2), c1->(group_id, tid_in_group*2+1),
+//                  c2->(group_id+8, tid_in_group*2), c3->(group_id+8, tid_in_group*2+1)
+// n_tile gives the column block offset (n_tile * 8)
+// warp_id gives the row block offset (warp_id * 16)
+__device__ inline
+void frag_to_smem_row(
+    uint32_t smem_addr, int stride,  // stride in elements
+    int warp_id, int lane_id,
+    float frag[][4], int n_tiles)
+{
+    int group_id = lane_id >> 2;
+    int tid_in_group = lane_id & 3;
+    int r0 = warp_id * 16 + group_id;
+    int r1 = r0 + 8;
+
+    for (int n = 0; n < n_tiles; n++) {
+        int c0 = n * 8 + tid_in_group * 2;
+        int c1 = c0 + 1;
+
+        nv_bfloat16 v0 = __float2bfloat16(frag[n][0]);
+        nv_bfloat16 v1 = __float2bfloat16(frag[n][1]);
+        nv_bfloat16 v2 = __float2bfloat16(frag[n][2]);
+        nv_bfloat16 v3 = __float2bfloat16(frag[n][3]);
+
+        // Compute swizzled addresses
+        uint32_t a0 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
+            smem_addr + (r0 * stride + c0) * sizeof(nv_bfloat16));
+        uint32_t a1 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
+            smem_addr + (r0 * stride + c1) * sizeof(nv_bfloat16));
+        uint32_t a2 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
+            smem_addr + (r1 * stride + c0) * sizeof(nv_bfloat16));
+        uint32_t a3 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
+            smem_addr + (r1 * stride + c1) * sizeof(nv_bfloat16));
+
+        *(nv_bfloat16*)a0 = v0;
+        *(nv_bfloat16*)a1 = v1;
+        *(nv_bfloat16*)a2 = v2;
+        *(nv_bfloat16*)a3 = v3;
+    }
+}
+
+// Write C/D fragment transposed to smem: store frag[q_row, kv_col] as mat[kv_col, q_row]
+__device__ inline
+void frag_to_smem_transpose(
+    uint32_t smem_addr, int stride,  // stride = BLOCK_Q (columns in transposed layout)
+    int warp_id, int lane_id,
+    float frag[][4], int n_tiles)
+{
+    int group_id = lane_id >> 2;
+    int tid_in_group = lane_id & 3;
+    int q0 = warp_id * 16 + group_id;      // original row
+    int q1 = q0 + 8;
+
+    for (int n = 0; n < n_tiles; n++) {
+        int kv0 = n * 8 + tid_in_group * 2;  // original col
+        int kv1 = kv0 + 1;
+
+        nv_bfloat16 v0 = __float2bfloat16(frag[n][0]);
+        nv_bfloat16 v1 = __float2bfloat16(frag[n][1]);
+        nv_bfloat16 v2 = __float2bfloat16(frag[n][2]);
+        nv_bfloat16 v3 = __float2bfloat16(frag[n][3]);
+
+        // Transposed: [kv, q] layout
+        uint32_t a0 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
+            smem_addr + (kv0 * stride + q0) * sizeof(nv_bfloat16));
+        uint32_t a1 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
+            smem_addr + (kv1 * stride + q0) * sizeof(nv_bfloat16));
+        uint32_t a2 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
+            smem_addr + (kv0 * stride + q1) * sizeof(nv_bfloat16));
+        uint32_t a3 = swizzle<64 * (int)sizeof(nv_bfloat16)>(
+            smem_addr + (kv1 * stride + q1) * sizeof(nv_bfloat16));
+
+        *(nv_bfloat16*)a0 = v0;
+        *(nv_bfloat16*)a1 = v1;
+        *(nv_bfloat16*)a2 = v2;
+        *(nv_bfloat16*)a3 = v3;
+    }
+}
+
+template <int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS, bool IS_CAUSAL>
+__global__ void flash_attention_backward_kernel(
+    const nv_bfloat16 *Q,   // [bs, q_head, q_len, dim]
+    const nv_bfloat16 *K,   // [bs, kv_head, kv_len, dim]
+    const nv_bfloat16 *V,   // [bs, kv_head, kv_len, dim]
+    const float *L,          // [bs, q_head, q_len]
+    const nv_bfloat16 *dO,  // [bs, q_head, q_len, dim]
+    const float *D,          // [bs, q_head, q_len]
+    float *dQ_acc,           // [bs, q_head, q_len, dim]
+    float *dK_acc,           // [bs, kv_head, kv_len, dim]
+    float *dV_acc,           // [bs, kv_head, kv_len, dim]
+    int bs, int q_head, int kv_head, int q_len, int kv_len, int head_dim,
+    int q_kv_ratio, float scale)
+{
+    constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
+    constexpr int STRIDE = 64; // all matrices are 64-wide
+
+    int kv_block_idx = blockIdx.x;
+    int batch_kv_head = blockIdx.y;
+    int batch_idx = batch_kv_head / kv_head;
+    int kv_head_idx = batch_kv_head % kv_head;
+
+    int kv_start = kv_block_idx * BLOCK_KV;
+    if (kv_start >= kv_len) return;
+
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    int group_id = lane_id >> 2;
+    int tid_in_group = lane_id & 3;
+
+    // Shared memory: K_s[64x64], V_s[64x64], BufA[64x64], BufB[64x64]
+    extern __shared__ char smem[];
+    constexpr int BLK_SIZE = 64 * 64 * sizeof(nv_bfloat16); // 8KB
+
+    uint32_t K_s_addr, V_s_addr, BufA_addr, BufB_addr;
+    {
+        nv_bfloat16 *K_s = reinterpret_cast<nv_bfloat16*>(smem);
+        nv_bfloat16 *V_s = reinterpret_cast<nv_bfloat16*>(smem + BLK_SIZE);
+        nv_bfloat16 *BufA = reinterpret_cast<nv_bfloat16*>(smem + 2 * BLK_SIZE);
+        nv_bfloat16 *BufB = reinterpret_cast<nv_bfloat16*>(smem + 3 * BLK_SIZE);
+        asm("cvta.to.shared.u32 %0, %1;" : "=r"(K_s_addr) : "l"(K_s));
+        asm("cvta.to.shared.u32 %0, %1;" : "=r"(V_s_addr) : "l"(V_s));
+        asm("cvta.to.shared.u32 %0, %1;" : "=r"(BufA_addr) : "l"(BufA));
+        asm("cvta.to.shared.u32 %0, %1;" : "=r"(BufB_addr) : "l"(BufB));
+    }
+
+    // Load K_j, V_j to smem
+    const nv_bfloat16 *K_base = K + ((size_t)batch_idx * kv_head * kv_len + kv_head_idx * kv_len + kv_start) * head_dim;
+    const nv_bfloat16 *V_base = V + ((size_t)batch_idx * kv_head * kv_len + kv_head_idx * kv_len + kv_start) * head_dim;
+
+    global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(K_s_addr, K_base, head_dim, tid);
+    global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(V_s_addr, V_base, head_dim, tid);
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
+
+    // dK, dV accumulators: each warp owns 16 rows of [BLOCK_KV, DIM]
+    float dK_frag[8][4] = {};
+    float dV_frag[8][4] = {};
+
+    for (int qh_offset = 0; qh_offset < q_kv_ratio; qh_offset++) {
+        int q_head_idx = kv_head_idx * q_kv_ratio + qh_offset;
+        int num_q_blocks = cdiv(q_len, BLOCK_Q);
+
+        int q_block_start = 0;
+        int q_block_end = num_q_blocks;
+        if constexpr (IS_CAUSAL) {
+            q_block_start = kv_start / BLOCK_Q;
+        }
+
+        for (int q_block = q_block_start; q_block < q_block_end; q_block++) {
+            int q_start = q_block * BLOCK_Q;
+            int q_valid = min(BLOCK_Q, q_len - q_start);
+
+            size_t q_offset = ((size_t)batch_idx * q_head * q_len + q_head_idx * q_len + q_start) * head_dim;
+            const nv_bfloat16 *Q_base = Q + q_offset;
+            const nv_bfloat16 *dO_base = dO + q_offset;
+            const float *L_base = L + (size_t)batch_idx * q_head * q_len + q_head_idx * q_len + q_start;
+            const float *D_base = D + (size_t)batch_idx * q_head * q_len + q_head_idx * q_len + q_start;
+
+            // ======== Step 0: Load Q_i -> BufA, dO_i -> BufB ========
+            global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(BufA_addr, Q_base, head_dim, tid);
+            global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(BufB_addr, dO_base, head_dim, tid);
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 0;");
+            __syncthreads();
+
+            // ======== Step 1: S = Q @ K^T, then P = exp(S*scale - L) ========
+            float S_frag[8][4] = {};
+            mma_AB_T<DIM, 8>(S_frag, BufA_addr, STRIDE, warp_id * 16,
+                             K_s_addr, STRIDE, lane_id);
+
+            // Scale and compute P
+            float P_frag[8][4];
+            for (int n = 0; n < 8; n++) {
+                int abs_row[4], abs_col[4];
+                abs_row[0] = warp_id * 16 + group_id;
+                abs_row[1] = abs_row[0];
+                abs_row[2] = abs_row[0] + 8;
+                abs_row[3] = abs_row[2];
+                abs_col[0] = n * 8 + tid_in_group * 2;
+                abs_col[1] = abs_col[0] + 1;
+                abs_col[2] = abs_col[0];
+                abs_col[3] = abs_col[1];
+
+                for (int i = 0; i < 4; i++) {
+                    float l_val = (abs_row[i] < q_valid) ? L_base[abs_row[i]] : 0.0f;
+                    float s_val = S_frag[n][i] * scale - l_val;
+
+                    bool masked = (abs_row[i] >= q_valid) || (abs_col[i] >= (min(BLOCK_KV, kv_len - kv_start)));
+                    if constexpr (IS_CAUSAL) {
+                        if ((q_start + abs_row[i]) < (kv_start + abs_col[i])) masked = true;
+                    }
+                    P_frag[n][i] = masked ? 0.0f : expf(s_val);
+                }
+            }
+
+            // ======== Step 2: dP = dO @ V^T ========
+            float dP_frag[8][4] = {};
+            mma_AB_T<DIM, 8>(dP_frag, BufB_addr, STRIDE, warp_id * 16,
+                             V_s_addr, STRIDE, lane_id);
+
+            // ======== Step 3: dS = P * (dP - D) ========
+            float dS_frag[8][4];
+            for (int n = 0; n < 8; n++) {
+                int r0 = warp_id * 16 + group_id;
+                int r1 = r0 + 8;
+                float d0 = (r0 < q_valid) ? D_base[r0] : 0.0f;
+                float d1 = (r1 < q_valid) ? D_base[r1] : 0.0f;
+
+                dS_frag[n][0] = P_frag[n][0] * (dP_frag[n][0] - d0);
+                dS_frag[n][1] = P_frag[n][1] * (dP_frag[n][1] - d0);
+                dS_frag[n][2] = P_frag[n][2] * (dP_frag[n][2] - d1);
+                dS_frag[n][3] = P_frag[n][3] * (dP_frag[n][3] - d1);
+
+                // Apply scale to dS
+                dS_frag[n][0] *= scale;
+                dS_frag[n][1] *= scale;
+                dS_frag[n][2] *= scale;
+                dS_frag[n][3] *= scale;
+            }
+
+            // ======== Step 4: Write P^T to BufA, compute dV += P^T @ dO ========
+            // BufA now becomes P^T[BLOCK_KV, BLOCK_Q], BufB still has dO
+            frag_to_smem_transpose(BufA_addr, STRIDE, warp_id, lane_id, P_frag, 8);
+            __syncthreads();
+
+            // dV += P^T_s @ dO_s^T  (but dO is in BufB with stride=DIM)
+            mma_AB_T<BLOCK_Q, 8>(dV_frag, BufA_addr, STRIDE, warp_id * 16,
+                                 BufB_addr, STRIDE, lane_id);
+
+            // ======== Step 5: Write dS^T to BufB, reload Q to BufA, compute dK ========
+            frag_to_smem_transpose(BufB_addr, STRIDE, warp_id, lane_id, dS_frag, 8);
+            // Reload Q_i to BufA
+            global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(BufA_addr, Q_base, head_dim, tid);
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 0;");
+            __syncthreads();
+
+            // dK += dS^T_s @ Q_s^T (Q in BufA with stride=DIM)
+            mma_AB_T<BLOCK_Q, 8>(dK_frag, BufB_addr, STRIDE, warp_id * 16,
+                                 BufA_addr, STRIDE, lane_id);
+
+            // ======== Step 6: Write dS to BufA, compute dQ += dS @ K ========
+            frag_to_smem_row(BufA_addr, STRIDE, warp_id, lane_id, dS_frag, 8);
+            __syncthreads();
+
+            float dQ_frag[8][4] = {};
+            mma_AB_T<BLOCK_KV, 8>(dQ_frag, BufA_addr, STRIDE, warp_id * 16,
+                                  K_s_addr, STRIDE, lane_id);
+
+            // Atomic write dQ to global
+            size_t dq_base = ((size_t)batch_idx * q_head * q_len + q_head_idx * q_len + q_start) * head_dim;
+            for (int n = 0; n < 8; n++) {
+                int c0 = n * 8 + tid_in_group * 2;
+                int c1 = c0 + 1;
+                int r0 = warp_id * 16 + group_id;
+                int r1 = r0 + 8;
+                if (r0 < q_valid) {
+                    atomicAdd(&dQ_acc[dq_base + r0 * head_dim + c0], dQ_frag[n][0]);
+                    atomicAdd(&dQ_acc[dq_base + r0 * head_dim + c1], dQ_frag[n][1]);
+                }
+                if (r1 < q_valid) {
+                    atomicAdd(&dQ_acc[dq_base + r1 * head_dim + c0], dQ_frag[n][2]);
+                    atomicAdd(&dQ_acc[dq_base + r1 * head_dim + c1], dQ_frag[n][3]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Write dK, dV to global
+    int kv_valid = min(BLOCK_KV, kv_len - kv_start);
+    size_t dk_base = ((size_t)batch_idx * kv_head * kv_len + kv_head_idx * kv_len + kv_start) * head_dim;
+    for (int n = 0; n < 8; n++) {
+        int c0 = n * 8 + tid_in_group * 2;
+        int c1 = c0 + 1;
+        int r0 = warp_id * 16 + group_id;
+        int r1 = r0 + 8;
+        if (r0 < kv_valid) {
+            dK_acc[dk_base + r0 * head_dim + c0] = dK_frag[n][0];
+            dK_acc[dk_base + r0 * head_dim + c1] = dK_frag[n][1];
+            dV_acc[dk_base + r0 * head_dim + c0] = dV_frag[n][0];
+            dV_acc[dk_base + r0 * head_dim + c1] = dV_frag[n][1];
+        }
+        if (r1 < kv_valid) {
+            dK_acc[dk_base + r1 * head_dim + c0] = dK_frag[n][2];
+            dK_acc[dk_base + r1 * head_dim + c1] = dK_frag[n][3];
+            dV_acc[dk_base + r1 * head_dim + c0] = dV_frag[n][2];
+            dV_acc[dk_base + r1 * head_dim + c1] = dV_frag[n][3];
+        }
+    }
+}
+
 void attention_v6_backward(
     const nv_bfloat16 *Q,
     const nv_bfloat16 *K,
     const nv_bfloat16 *V,
     const nv_bfloat16 *O,
-    const nv_bfloat16 *L,
+    const nv_bfloat16 *L_bf16,
     const nv_bfloat16 *dO,
     nv_bfloat16 *dQ,
     nv_bfloat16 *dK,
@@ -247,25 +396,78 @@ void attention_v6_backward(
     int q_len,
     int kv_len,
     int head_dim,
-    bool is_causal
-){
+    bool is_causal)
+{
     ASSERT_NOT_NULL(Q, K, V, O, dO, dQ, dK, dV);
-    if(q_head % kv_head){
-        ERROR("q_head is %d, kv_head is %d, q_head % kv_head not equal 0", q_head,kv_head);
-    }
-    // 四种情况
-    // 1) 非gqa + 非causal
-    // 2) gqa + 非causal
-    // 3) 非gqa + causal
-    // 4) gqa + causal
-    const int KV_BLOCKS = 64;
-    const int Q_BLOCKS = 64;
-    const int kv_blocks = batch_size * q_head * cdiv(kv_len, KV_BLOCKS);
-    const int TB_SIZE = 128;
-    const int WARP_SIZE = 32;
-    const int NUM_WARPS = 4;
-    const int DIM = 64;
-    if(is_causal == false && q_head == kv_head){
+    if (q_head % kv_head)
+        ERROR("q_head(%d) %% kv_head(%d) != 0", q_head, kv_head);
 
+    int q_kv_ratio = q_head / kv_head;
+
+    // Convert L from bf16 to float
+    int L_size = batch_size * q_head * q_len;
+    float *L_float;
+    CUDA_CHECK(cudaMalloc(&L_float, L_size * sizeof(float)));
+    {
+        int block = 256;
+        int grid = cdiv(L_size, block);
+        bf16_to_float_kernel<<<grid, block>>>(L_bf16, L_float, L_size);
     }
+
+    // Compute D = rowsum(dO * O)
+    float *D;
+    CUDA_CHECK(cudaMalloc(&D, L_size * sizeof(float)));
+    {
+        int block = 256;
+        dim3 grid(cdiv(q_len, block), batch_size * q_head);
+        compute_D_kernel<<<grid, block>>>(O, dO, D, q_head, q_len, head_dim);
+    }
+
+    // Allocate float accumulators
+    int dQ_size = batch_size * q_head * q_len * head_dim;
+    int dKV_size = batch_size * kv_head * kv_len * head_dim;
+    float *dQ_acc, *dK_acc, *dV_acc;
+    CUDA_CHECK(cudaMalloc(&dQ_acc, dQ_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dK_acc, dKV_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dV_acc, dKV_size * sizeof(float)));
+    CUDA_CHECK(cudaMemset(dQ_acc, 0, dQ_size * sizeof(float)));
+    CUDA_CHECK(cudaMemset(dK_acc, 0, dKV_size * sizeof(float)));
+    CUDA_CHECK(cudaMemset(dV_acc, 0, dKV_size * sizeof(float)));
+
+    // Launch backward kernel
+    constexpr int BLOCK_Q = 64, BLOCK_KV = 64, DIM = 64, NUM_WARPS = 4;
+    int num_kv_blocks = cdiv(kv_len, BLOCK_KV);
+    dim3 grid(num_kv_blocks, batch_size * kv_head);
+    int block_size = NUM_WARPS * WARP_SIZE;
+    int smem_size = 4 * BLOCK_KV * DIM * sizeof(nv_bfloat16); // 32KB
+
+    if (is_causal) {
+        launch_kernel(
+            flash_attention_backward_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, true>,
+            grid, block_size, smem_size,
+            Q, K, V, L_float, dO, D, dQ_acc, dK_acc, dV_acc,
+            batch_size, q_head, kv_head, q_len, kv_len, head_dim,
+            q_kv_ratio, 1.0f / sqrtf((float)head_dim));
+    } else {
+        launch_kernel(
+            flash_attention_backward_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS, false>,
+            grid, block_size, smem_size,
+            Q, K, V, L_float, dO, D, dQ_acc, dK_acc, dV_acc,
+            batch_size, q_head, kv_head, q_len, kv_len, head_dim,
+            q_kv_ratio, 1.0f / sqrtf((float)head_dim));
+    }
+
+    // Convert float accumulators to bf16
+    {
+        int block = 256;
+        float_to_bf16_kernel<<<cdiv(dQ_size, block), block>>>(dQ_acc, dQ, dQ_size);
+        float_to_bf16_kernel<<<cdiv(dKV_size, block), block>>>(dK_acc, dK, dKV_size);
+        float_to_bf16_kernel<<<cdiv(dKV_size, block), block>>>(dV_acc, dV, dKV_size);
+    }
+
+    CUDA_CHECK(cudaFree(L_float));
+    CUDA_CHECK(cudaFree(D));
+    CUDA_CHECK(cudaFree(dQ_acc));
+    CUDA_CHECK(cudaFree(dK_acc));
+    CUDA_CHECK(cudaFree(dV_acc));
 }

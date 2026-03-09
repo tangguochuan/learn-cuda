@@ -133,6 +133,33 @@ void gloabl_to_shared_swizzle_padded(
   }
 }
 
+// 初始化 shared memory 为 0，使用 swizzle 避免 bank conflict
+template <int HEIGHT, int WIDTH, int TB_SIZE>
+__device__ inline
+void init_shared_zero(uint32_t dst, int tid) {
+  constexpr int num_elems = 16 / sizeof(nv_bfloat16);  // 16 bytes per store
+  constexpr int num_iters = HEIGHT * WIDTH / (TB_SIZE * num_elems);
+
+  for (int iter = 0; iter < num_iters; iter++) {
+    const int idx = (iter * TB_SIZE + tid) * num_elems;
+    const int row = idx / WIDTH;
+    const int col = idx % WIDTH;
+
+    const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(
+        dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
+
+    // 使用 st.shared.v4.b32 一次写入 16 bytes
+    asm volatile(
+      "{\n"
+      ".reg .v4 .b32 zeros;\n"
+      "mov.v4.b32 zeros, {0, 0, 0, 0};\n"
+      "st.shared.v4.b32 [%0], zeros;\n"
+      "}\n"
+      :: "r"(dst_addr)
+    );
+  }
+}
+
 __device__ inline
 void ldmatrix_x2(uint32_t regs[2], uint32_t addr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
@@ -173,6 +200,20 @@ void mma_m16n8k16(uint32_t A[4], uint32_t B[2], float D[4]) {
                 "r"(B[0]), "r"(B[1]),
                 "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]));
 }
+
+__device__ inline
+void mma_m16n8k16_inverse(uint32_t A[4], uint32_t B[2], float D[4]) {
+  asm volatile("mma.sync.aligned.m16n8k16.col.col.f32.bf16.bf16.f32 "
+              "{%0, %1, %2, %3}, "
+              "{%4, %5, %6, %7}, "
+              "{%8, %9}, "
+              "{%10, %11, %12, %13};"
+              : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
+              : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                "r"(B[0]), "r"(B[1]),
+                "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]));
+}
+
 
 template <typename T, typename... Args>
 void launch_kernel(
